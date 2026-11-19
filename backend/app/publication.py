@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from .config import Settings
 from .db.models import CampaignSnapshot, StreamDraft
-from .keitaro import OfferBinding, Stream, fetch_stream, replace_offers
+from .keitaro import OfferBinding, Stream, fetch_active_offer, fetch_stream, replace_offers
 from .stream_editor import DraftOffer, EditorStream, editor_stream, offer_signature
 
 
@@ -33,6 +33,11 @@ def publish_draft(
     actual = offer_signature(remote.offers)
     if actual != baseline and actual != expected:
         raise HTTPException(409, "Офферы изменились в Keitaro. Черновик сохранён.")
+
+    # Validate every binding being kept, including disabled bindings. Removed
+    # offers are excluded so an archived offer can still be removed from a flow.
+    for offer_id in sorted({offer.offer_id for offer in desired}):
+        fetch_active_offer(offer_id, settings)
 
     if actual != expected:
         write_error = None

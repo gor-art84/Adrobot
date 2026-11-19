@@ -89,7 +89,7 @@ def edit_draft(
     settings: Annotated[Settings, Depends(get_settings)],
 ) -> EditorStream:
     name = None
-    if isinstance(action, OfferAction) and action.action == "add":
+    if isinstance(action, OfferAction) and action.action in {"add", "restore"}:
         name = fetch_active_offer(action.offer_id, settings).name
 
     lock = mutation_locks[campaign_id % len(mutation_locks)]

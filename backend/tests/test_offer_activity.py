@@ -14,6 +14,7 @@ from app.config import Settings
 from app.db.models import Base, CampaignCreation, CampaignSnapshot, StreamDraft
 from app.db.session import get_engine
 from app.main import app, get_settings
+from app.keitaro import OfferBinding, Stream
 
 
 class OfferActivityTests(unittest.IsolatedAsyncioTestCase):
@@ -163,3 +164,186 @@ class OfferActivityTests(unittest.IsolatedAsyncioTestCase):
             second = await self.client.post('/api/campaigns', json=self.payload)
             self.assertEqual(second.status_code, 201, second.text)
             create.assert_called_once()
+    def prepare_restore(self):
+        offers = [*self.original_offers,
+                  dict(offer_id=20, share=0, state='active', removed=True, pinned=False, name='Offer 20')]
+        with Session(self.engine) as session, session.begin():
+            draft = session.get(StreamDraft, (1, 2))
+            if draft is None:
+                draft = StreamDraft(campaign_id=1, stream_id=2)
+                session.add(draft)
+            draft.revision = 5
+            draft.baseline = self.original_offers
+            draft.offers = offers
+            draft.published_offers = offers
+        return self.local_state()
+
+    def local_state(self):
+        with Session(self.engine) as session:
+            draft = session.get(StreamDraft, (1, 2))
+            snapshot = session.get(CampaignSnapshot, 1)
+            return dict(revision=draft.revision, offers=draft.offers,
+                        baseline=draft.baseline, published=draft.published_offers,
+                        streams=snapshot.streams, fetched_at=snapshot.fetched_at)
+
+    async def test_bring_back_active_offer_restores_and_redistributes(self):
+        self.prepare_restore()
+        with patch('app.keitaro.httpx.request', return_value=self.offer_response()) as request:
+            response = await self.client.post('/api/campaigns/1/streams/2/draft',
+                                             json=dict(action='restore', offer_id=20, revision=5))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(request.call_args.args[0], 'GET')
+        result = response.json()
+        self.assertEqual(result['revision'], 6)
+        self.assertTrue(result['dirty'])
+        self.assertEqual([row['share'] for row in result['offers']], [50, 50])
+        self.assertFalse(result['offers'][1]['removed'])
+
+    async def test_bring_back_rejects_inactive_and_invalid_offers_without_changing_draft(self):
+        cases = [(self.offer_response(state), 422) for state in ('disabled', 'deleted', 'archived', 'unknown')]
+        cases += [(httpx.Response(200, json=dict(id=20, name='Missing state')), 502),
+                  (httpx.Response(200, json=dict(id=99, name='Wrong ID', state='active')), 502),
+                  (httpx.Response(404), 404), (httpx.Response(503), 502)]
+        for remote, status in cases:
+            with self.subTest(response=remote.content):
+                before = self.prepare_restore()
+                with patch('app.keitaro.httpx.request', return_value=remote):
+                    response = await self.client.post('/api/campaigns/1/streams/2/draft',
+                                                     json=dict(action='restore', offer_id=20, revision=5))
+                self.assertEqual(response.status_code, status, response.text)
+                self.assertEqual(self.local_state(), before)
+
+    async def test_bring_back_timeout_keeps_draft(self):
+        before = self.prepare_restore()
+        with patch('app.keitaro.httpx.request', side_effect=httpx.ReadTimeout('Timeout')):
+            response = await self.client.post('/api/campaigns/1/streams/2/draft',
+                                             json=dict(action='restore', offer_id=20, revision=5))
+        self.assertEqual(response.status_code, 504)
+        self.assertEqual(self.local_state(), before)
+
+    def prepare_publication(self, offers=None):
+        if offers is None:
+            offers = [dict(offer_id=20, share=100, state='active'),
+                      dict(offer_id=10, share=0, state='active', removed=True)]
+        with Session(self.engine) as session, session.begin():
+            draft = session.get(StreamDraft, (1, 2))
+            if draft is None:
+                draft = StreamDraft(campaign_id=1, stream_id=2)
+                session.add(draft)
+            draft.revision = 5
+            draft.baseline = self.original_offers
+            draft.offers = offers
+            draft.published_offers = self.original_offers
+        original = Stream(id=2, name='Offers', type='default', campaign_id=1,
+                          offers=self.original_offers)
+        desired = original.model_copy(update={'offers': [
+            # Remote bindings do not include local archive/pinning metadata.
+            OfferBinding.model_validate(row)
+            for row in offers if not row.get('removed', False)
+        ]})
+        return original, desired
+
+    async def test_publish_active_offer_checks_catalog_and_excludes_removed_offers(self):
+        original, desired = self.prepare_publication()
+        with patch('app.publication.read_target', side_effect=[original, desired]), \
+             patch('app.keitaro.httpx.request', return_value=self.offer_response()) as request, \
+             patch('app.publication.replace_offers') as write:
+            response = await self.client.post('/api/campaigns/1/streams/2/push', json=dict(revision=5))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertFalse(response.json()['dirty'])
+        self.assertEqual(response.json()['revision'], 6)
+        request.assert_called_once()
+        self.assertTrue(request.call_args.args[1].endswith('/offers/20'))
+        write.assert_called_once_with(2, desired.offers, self.settings)
+        self.assertIsNone(self.local_state()['offers'])
+
+    async def test_publish_rejects_inactive_or_unverifiable_offers_before_write(self):
+        cases = [(self.offer_response(state), 422) for state in ('disabled', 'deleted', 'archived', 'unknown')]
+        cases += [(httpx.Response(200, json=dict(id=20, name='Missing state')), 502),
+                  (httpx.Response(200, json=dict(id=20, name='Null state', state=None)), 502),
+                  (httpx.Response(200, json=dict(id=99, name='Wrong ID', state='active')), 502),
+                  (httpx.Response(404), 404), (httpx.Response(503), 502)]
+        for remote, status in cases:
+            with self.subTest(response=remote.content):
+                original, _ = self.prepare_publication()
+                before = self.local_state()
+                with patch('app.publication.read_target', return_value=original), \
+                     patch('app.keitaro.httpx.request', return_value=remote), \
+                     patch('app.publication.replace_offers') as write:
+                    response = await self.client.post('/api/campaigns/1/streams/2/push', json=dict(revision=5))
+                self.assertEqual(response.status_code, status, response.text)
+                write.assert_not_called()
+                self.assertEqual(self.local_state(), before)
+
+    async def test_publish_timeout_checking_activity_keeps_draft_and_snapshot(self):
+        original, _ = self.prepare_publication()
+        before = self.local_state()
+        with patch('app.publication.read_target', return_value=original), \
+             patch('app.keitaro.httpx.request', side_effect=httpx.ReadTimeout('Timeout')), \
+             patch('app.publication.replace_offers') as write:
+            response = await self.client.post('/api/campaigns/1/streams/2/push', json=dict(revision=5))
+        self.assertEqual(response.status_code, 504)
+        write.assert_not_called()
+        self.assertEqual(self.local_state(), before)
+
+    async def test_publish_checks_all_retained_offers_including_disabled_bindings(self):
+        original, _ = self.prepare_publication([
+            dict(offer_id=20, share=100, state='active'),
+            dict(offer_id=30, share=0, state='disabled'),
+        ])
+        before = self.local_state()
+        with patch('app.publication.read_target', return_value=original), \
+             patch('app.keitaro.httpx.request', side_effect=[
+                 self.offer_response(),
+                 httpx.Response(200, json=dict(id=30, name='Archived', state='deleted')),
+             ]) as request, patch('app.publication.replace_offers') as write:
+            response = await self.client.post('/api/campaigns/1/streams/2/push', json=dict(revision=5))
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(request.call_count, 2)
+        self.assertTrue(request.call_args.args[1].endswith('/offers/30'))
+        write.assert_not_called()
+        self.assertEqual(self.local_state(), before)
+
+    async def test_publish_checks_activity_even_when_remote_already_matches(self):
+        for active in (False, True):
+            with self.subTest(active=active):
+                _, desired = self.prepare_publication()
+                before = self.local_state()
+                with patch('app.publication.read_target', return_value=desired), \
+                     patch('app.keitaro.httpx.request', return_value=self.offer_response('active' if active else 'deleted')), \
+                     patch('app.publication.replace_offers') as write:
+                    response = await self.client.post('/api/campaigns/1/streams/2/push', json=dict(revision=5))
+                write.assert_not_called()
+                self.assertEqual(response.status_code, 200 if active else 422, response.text)
+                if active:
+                    self.assertIsNone(self.local_state()['offers'])
+                else:
+                    self.assertEqual(self.local_state(), before)
+
+    async def test_publish_can_remove_all_archived_offers_without_catalog_checks(self):
+        original, desired = self.prepare_publication([
+            dict(offer_id=10, share=0, state='active', removed=True),
+        ])
+        with patch('app.publication.read_target', side_effect=[original, desired]), \
+             patch('app.keitaro.httpx.request') as request, \
+             patch('app.publication.replace_offers') as write:
+            response = await self.client.post('/api/campaigns/1/streams/2/push', json=dict(revision=5))
+        self.assertEqual(response.status_code, 200, response.text)
+        request.assert_not_called()
+        write.assert_called_once_with(2, [], self.settings)
+    async def test_bring_back_checks_offer_from_published_archive_without_open_draft(self):
+        for active in (False, True):
+            with self.subTest(active=active):
+                self.prepare_restore()
+                with Session(self.engine) as session, session.begin():
+                    session.get(StreamDraft, (1, 2)).offers = None
+                before = self.local_state()
+                with patch('app.keitaro.httpx.request', return_value=self.offer_response('active' if active else 'deleted')):
+                    response = await self.client.post('/api/campaigns/1/streams/2/draft',
+                                                     json=dict(action='restore', offer_id=20, revision=5))
+                self.assertEqual(response.status_code, 200 if active else 422, response.text)
+                if active:
+                    self.assertTrue(response.json()['dirty'])
+                    self.assertFalse(response.json()['offers'][1]['removed'])
+                else:
+                    self.assertEqual(self.local_state(), before)

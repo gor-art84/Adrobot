@@ -12,7 +12,7 @@ from app.campaigns import CampaignCreated, CampaignInput, create_campaign
 from app.config import Settings
 from app.db.models import Base, CampaignCreation, CampaignSnapshot, StreamDraft
 from app.db.session import get_engine
-from app.keitaro import OfferBinding, Stream
+from app.keitaro import Offer, OfferBinding, Stream
 from app.publication import publish_draft
 from app.stream_editor import offer_signature
 
@@ -80,6 +80,10 @@ class RegressionTests(unittest.TestCase):
             self.assertIsNone(session.get(CampaignCreation, str(self.data.operation_id)))
 
     def prepare_draft(self):
+        activity = patch('app.publication.fetch_active_offer',
+                         return_value=Offer(id=20, name='Offer', state='active'))
+        activity.start()
+        self.addCleanup(activity.stop)
         original = Stream(id=2, name='Offers', type='default', campaign_id=1,
                           offers=[OfferBinding(offer_id=10, share=100, state='active')])
         desired = original.model_copy(update={'offers': [OfferBinding(offer_id=20, share=100, state='active')]})

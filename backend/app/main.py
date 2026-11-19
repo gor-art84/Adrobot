@@ -93,10 +93,14 @@ def edit_draft(
         name = fetch_active_offer(action.offer_id, settings).name
 
     lock = mutation_locks[campaign_id % len(mutation_locks)]
-    with lock, Session(get_engine(settings.database_path)) as session, session.begin():
-        # Serialize the revision check and write with other SQLite writers.
-        session.execute(text("BEGIN IMMEDIATE"))
-        return change_draft(session, campaign_id, stream_id, action, name)
+    try:
+        with lock, Session(get_engine(settings.database_path)) as session, session.begin():
+            # Serialize the revision check and write with other SQLite writers.
+            session.execute(text("BEGIN IMMEDIATE"))
+            return change_draft(session, campaign_id, stream_id, action, name)
+    except SQLAlchemyError as exc:
+        logger.error("Could not change draft for stream %s: %s", stream_id, type(exc).__name__)
+        raise HTTPException(503, "Не удалось изменить черновик в SQLite. Повторите запрос позже.") from exc
 
 
 @app.post("/api/campaigns/{campaign_id}/streams/{stream_id}/push")

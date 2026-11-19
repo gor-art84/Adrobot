@@ -1,9 +1,11 @@
+import logging
 from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, StrictBool, StringConstraints, TypeAdapter, ValidationError
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from .config import Settings
@@ -12,6 +14,7 @@ from .db.session import get_engine
 from .keitaro import OfferBinding, fetch_active_offer, get_from_keitaro, request_keitaro
 
 GOOGLE_URL = "https://google.com"
+logger = logging.getLogger(__name__)
 
 
 class CampaignInput(BaseModel):
@@ -99,7 +102,6 @@ def create_campaign(data: CampaignInput, settings: Settings) -> CampaignCreated:
     operation_id = str(data.operation_id)
     alias = f"adrobot-{data.operation_id.hex}"
     payload = data.model_dump(mode="json")
-    engine = get_engine(settings.database_path)
 
     def previous_result(operation: CampaignCreation) -> CampaignCreated:
         if operation.payload != payload:
@@ -111,19 +113,26 @@ def create_campaign(data: CampaignInput, settings: Settings) -> CampaignCreated:
             "alias": alias,
         })
 
-    with Session(engine) as session:
-        operation = session.get(CampaignCreation, operation_id)
-        if operation is not None:
-            return previous_result(operation)
+    try:
+        engine = get_engine(settings.database_path)
+        with Session(engine) as session:
+            operation = session.get(CampaignCreation, operation_id)
+            if operation is not None:
+                return previous_result(operation)
+    except SQLAlchemyError as exc:
+        raise creation_storage_error(exc, alias) from exc
 
     # Validation is read-only; failures here can safely be retried.
     validate_campaign(data, settings)
-    with Session(engine) as session, session.begin():
-        session.execute(text("BEGIN IMMEDIATE"))
-        operation = session.get(CampaignCreation, operation_id)
-        if operation is not None:
-            return previous_result(operation)
-        session.add(CampaignCreation(operation_id=operation_id, payload=payload))
+    try:
+        with Session(engine) as session, session.begin():
+            session.execute(text("BEGIN IMMEDIATE"))
+            operation = session.get(CampaignCreation, operation_id)
+            if operation is not None:
+                return previous_result(operation)
+            session.add(CampaignCreation(operation_id=operation_id, payload=payload))
+    except SQLAlchemyError as exc:
+        raise creation_storage_error(exc, alias) from exc
 
     # A committed reservation prevents duplicate POSTs even after a crash or timeout.
     try:
@@ -135,10 +144,32 @@ def create_campaign(data: CampaignInput, settings: Settings) -> CampaignCreated:
             "message": f"{detail['message']} Проверьте кампанию с alias {alias}. Повторное создание этой операции остановлено.",
             "alias": alias,
         }) from exc
-    with Session(engine) as session, session.begin():
-        operation = session.get(CampaignCreation, operation_id)
-        operation.result = result.model_dump(mode="json")
+    try:
+        with Session(engine) as session, session.begin():
+            operation = session.get(CampaignCreation, operation_id)
+            operation.result = result.model_dump(mode="json")
+    except SQLAlchemyError as exc:
+        raise creation_storage_error(exc, alias, result) from exc
     return result
+
+
+def creation_storage_error(
+    exc: SQLAlchemyError, alias: str, result: CampaignCreated | None = None,
+) -> HTTPException:
+    logger.error("Could not store creation operation %s: %s", alias, type(exc).__name__)
+    if result is not None:
+        return HTTPException(503, {
+            "message": f"Кампания {result.id} создана в Keitaro, но результат не удалось сохранить в SQLite. "
+                       f"Проверьте кампанию с alias {alias}. Не создавайте её повторно.",
+            "campaign_id": result.id,
+            "alias": alias,
+        })
+    return HTTPException(503, {
+        "message": "Не удалось прочитать или сохранить операцию создания в SQLite. "
+                   "Запрос создания в Keitaro не отправлялся в рамках этой попытки. "
+                   "Повторите запрос позже с тем же идентификатором операции.",
+        "alias": alias,
+    })
 
 
 def validate_campaign(data: CampaignInput, settings: Settings) -> None:

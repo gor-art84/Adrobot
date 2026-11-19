@@ -15,7 +15,7 @@ from .config import Settings
 from .db.models import CampaignSnapshot
 from .db.repository import save_snapshot
 from .db.session import get_engine
-from .keitaro import Stream, fetch_offer, fetch_streams
+from .keitaro import Stream, fetch_active_offer, fetch_streams
 from .publication import publish_draft
 from .stream_editor import (
     DraftAction, EditorStream, OfferAction, change_draft, list_editor_streams,
@@ -90,7 +90,7 @@ def edit_draft(
 ) -> EditorStream:
     name = None
     if isinstance(action, OfferAction) and action.action == "add":
-        name = fetch_offer(action.offer_id, settings).name
+        name = fetch_active_offer(action.offer_id, settings).name
 
     lock = mutation_locks[campaign_id % len(mutation_locks)]
     with lock, Session(get_engine(settings.database_path)) as session, session.begin():

@@ -93,6 +93,7 @@ def fetch_streams(campaign_id: int, settings: Settings) -> list[Stream]:
 class Offer(BaseModel):
     id: int
     name: str
+    state: str
 
 
 def fetch_offer(offer_id: int, settings: Settings) -> Offer:
@@ -103,4 +104,11 @@ def fetch_offer(offer_id: int, settings: Settings) -> Offer:
         raise HTTPException(502, "Keitaro вернул неожиданный формат оффера.") from exc
     if offer.id != offer_id:
         raise HTTPException(502, "Keitaro вернул оффер с другим ID.")
+    return offer
+
+
+def fetch_active_offer(offer_id: int, settings: Settings) -> Offer:
+    offer = fetch_offer(offer_id, settings)
+    if offer.state != "active":
+        raise HTTPException(422, f"Оффер {offer_id} неактивен в Keitaro. Выберите активный оффер.")
     return offer

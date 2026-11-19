@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from .config import Settings
 from .db.models import CampaignCreation
 from .db.session import get_engine
-from .keitaro import OfferBinding, fetch_offer, get_from_keitaro, request_keitaro
+from .keitaro import OfferBinding, fetch_active_offer, get_from_keitaro, request_keitaro
 
 GOOGLE_URL = "https://google.com"
 
@@ -151,7 +151,7 @@ def validate_campaign(data: CampaignInput, settings: Settings) -> None:
         if chosen_id not in {item.id for item in available}:
             raise HTTPException(422, f"Выбранный справочник недоступен: {label}.")
 
-    fetch_offer(data.offer_id, settings)
+    fetch_active_offer(data.offer_id, settings)
 
 
 def perform_creation(data: CampaignInput, settings: Settings, alias: str) -> CampaignCreated:

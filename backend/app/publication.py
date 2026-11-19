@@ -45,9 +45,9 @@ def publish_draft(
             remote = read_target(settings, campaign_id, stream_id)
         except HTTPException as exc:
             raise HTTPException(502, "Не удалось подтвердить запись в Keitaro. Черновик сохранён.") from exc
-        if write_error is not None:
-            raise write_error
         if offer_signature(remote.offers) != expected:
+            if write_error is not None:
+                raise write_error
             raise HTTPException(502, "Keitaro вернул другой состав или доли. Черновик сохранён.")
 
     with Session(engine) as session, session.begin():

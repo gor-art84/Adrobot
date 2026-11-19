@@ -26,3 +26,11 @@ class StreamDraft(Base):
     offers: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON(none_as_null=True))
     baseline: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON(none_as_null=True))
     published_offers: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON(none_as_null=True))
+
+
+class CampaignCreation(Base):
+    __tablename__ = "campaign_creations"
+
+    operation_id: Mapped[str] = mapped_column(primary_key=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSON(none_as_null=True))

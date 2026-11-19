@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { request } from "../../api/request";
 import { parseId } from "../../shared/parseId";
 
@@ -36,6 +36,7 @@ export function CreateCampaign({ openEditor }: { openEditor: (id: number) => voi
   const [country, setCountry] = useState("");
   const [enableAfterCreate, setEnableAfterCreate] = useState(false);
   const [saving, setSaving] = useState(false);
+  const operation = useRef<{ payload: string; id: string } | undefined>(undefined);
   const [created, setCreated] = useState<CreatedCampaign>();
   const missingOptions = options
     ? selects.filter((select) => options[select.options].length === 0)
@@ -84,12 +85,29 @@ export function CreateCampaign({ openEditor }: { openEditor: (id: number) => voi
     }
 
     setFieldError(undefined);
+    const payload = JSON.stringify(data);
+    try {
+      const saved = JSON.parse(sessionStorage.getItem("adrobot.creation") ?? "null");
+      if (saved?.payload === payload && typeof saved.id === "string") {
+        operation.current = saved;
+      }
+    } catch {
+      // The in-memory identifier still protects retries if storage is unavailable.
+    }
+    if (operation.current?.payload !== payload) {
+      operation.current = { payload, id: crypto.randomUUID() };
+    }
+    try {
+      sessionStorage.setItem("adrobot.creation", JSON.stringify(operation.current));
+    } catch {
+      // Switching sections preserves the mounted form and its identifier.
+    }
     setSaving(true);
     try {
       setCreated(await request<CreatedCampaign>("/api/campaigns", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(data),
+        body: JSON.stringify({ ...data, operation_id: operation.current.id }),
       }));
     } catch (error) {
       setError(error instanceof Error ? error.message : "Не удалось создать кампанию.");

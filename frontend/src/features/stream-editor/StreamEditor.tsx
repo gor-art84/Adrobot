@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { request } from "../../api/request";
 import { parseId } from "../../shared/parseId";
 
@@ -153,6 +153,10 @@ export function StreamEditor({ initialCampaignId }: { initialCampaignId?: number
   const [invalidId, setInvalidId] = useState(false);
   const [pending, setPending] = useState<"fetch" | "edit">();
   const loading = pending !== undefined;
+
+  useEffect(() => {
+    if (initialCampaignId !== undefined) setCampaignId(String(initialCampaignId));
+  }, [initialCampaignId]);
 
   async function loadStreams(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();

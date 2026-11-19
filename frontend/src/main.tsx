@@ -1,10 +1,9 @@
 import { useState } from "react";
-import { createRoot } from "react-dom/client";
 import { CreateCampaign } from "./features/create-campaign/CreateCampaign";
 import { StreamEditor } from "./features/stream-editor/StreamEditor";
 import "./styles.css";
 
-function App() {
+export function App() {
   const [screen, setScreen] = useState<"editor" | "create">("editor");
   const [campaignId, setCampaignId] = useState<number>();
 
@@ -19,18 +18,17 @@ function App() {
           </nav>
         </div>
       </header>
-      {screen === "editor" ? (
+      <div hidden={screen !== "editor"}>
         <StreamEditor initialCampaignId={campaignId} />
-      ) : (
+      </div>
+      <div hidden={screen !== "create"}>
         <main className="workspace">
           <CreateCampaign openEditor={(id) => {
             setCampaignId(id);
             setScreen("editor");
           }} />
         </main>
-      )}
+      </div>
     </>
   );
 }
-
-createRoot(document.getElementById("root")!).render(<App />);

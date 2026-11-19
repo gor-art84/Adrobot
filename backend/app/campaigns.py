@@ -1,16 +1,21 @@
 from typing import Annotated, Literal
-from uuid import uuid4
+from uuid import UUID
 
 from fastapi import HTTPException
 from pydantic import BaseModel, Field, StrictBool, StringConstraints, TypeAdapter, ValidationError
+from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from .config import Settings
+from .db.models import CampaignCreation
+from .db.session import get_engine
 from .keitaro import OfferBinding, fetch_offer, get_from_keitaro, request_keitaro
 
 GOOGLE_URL = "https://google.com"
 
 
 class CampaignInput(BaseModel):
+    operation_id: UUID
     name: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)]
     country: Annotated[str, StringConstraints(strip_whitespace=True, to_upper=True, pattern=r"^[A-Za-z]{2}$")]
     offer_id: int = Field(gt=0)
@@ -91,6 +96,52 @@ def load_campaign_options(settings: Settings) -> CampaignOptions:
 
 
 def create_campaign(data: CampaignInput, settings: Settings) -> CampaignCreated:
+    operation_id = str(data.operation_id)
+    alias = f"adrobot-{data.operation_id.hex}"
+    payload = data.model_dump(mode="json")
+    engine = get_engine(settings.database_path)
+
+    def previous_result(operation: CampaignCreation) -> CampaignCreated:
+        if operation.payload != payload:
+            raise HTTPException(409, "Идентификатор операции уже использован с другими настройками.")
+        if operation.result is not None:
+            return CampaignCreated.model_validate(operation.result)
+        raise HTTPException(409, {
+            "message": f"Операция уже начата. Проверьте кампанию с alias {alias} в Keitaro. Повторное создание остановлено.",
+            "alias": alias,
+        })
+
+    with Session(engine) as session:
+        operation = session.get(CampaignCreation, operation_id)
+        if operation is not None:
+            return previous_result(operation)
+
+    # Validation is read-only; failures here can safely be retried.
+    validate_campaign(data, settings)
+    with Session(engine) as session, session.begin():
+        session.execute(text("BEGIN IMMEDIATE"))
+        operation = session.get(CampaignCreation, operation_id)
+        if operation is not None:
+            return previous_result(operation)
+        session.add(CampaignCreation(operation_id=operation_id, payload=payload))
+
+    # A committed reservation prevents duplicate POSTs even after a crash or timeout.
+    try:
+        result = perform_creation(data, settings, alias)
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {"message": str(exc.detail)}
+        raise HTTPException(exc.status_code, {
+            **detail,
+            "message": f"{detail['message']} Проверьте кампанию с alias {alias}. Повторное создание этой операции остановлено.",
+            "alias": alias,
+        }) from exc
+    with Session(engine) as session, session.begin():
+        operation = session.get(CampaignCreation, operation_id)
+        operation.result = result.model_dump(mode="json")
+    return result
+
+
+def validate_campaign(data: CampaignInput, settings: Settings) -> None:
     options = load_campaign_options(settings)
     for chosen_id, available, label in (
         (data.domain_id, options.domains, "домен"),
@@ -101,7 +152,9 @@ def create_campaign(data: CampaignInput, settings: Settings) -> CampaignCreated:
             raise HTTPException(422, f"Выбранный справочник недоступен: {label}.")
 
     fetch_offer(data.offer_id, settings)
-    alias = f"adrobot-{uuid4().hex}"
+
+
+def perform_creation(data: CampaignInput, settings: Settings, alias: str) -> CampaignCreated:
     response = request_keitaro(
         "POST", "/campaigns", settings, "Метод создания кампании недоступен.",
         json={
